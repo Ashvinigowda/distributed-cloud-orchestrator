@@ -11,10 +11,12 @@ from app.database.db import (
     join_codes_collection
 )
 
+# ✅ YOUR SECURITY IMPORTS
+from security.token import generate_upload_token
+from security.vault import encrypt_key
+from security.node_auth import generate_node_token
+
 import random
-import hmac
-import hashlib
-import base64
 import uuid
 import time
 import string
@@ -22,7 +24,6 @@ import asyncio
 
 app = FastAPI()
 
-UPLOAD_SECRET = "super_secret_key"
 JWT_SECRET = "orchestrator_secret_key"
 JWT_ALGORITHM = "HS256"
 
@@ -36,12 +37,6 @@ class UploadRequest(BaseModel):
     external_file_id: str
     theatre_id: str
     total_shards: int
-
-
-class NodeRequest(BaseModel):
-    node_name: str
-    ip_address: str
-    storage_capacity: int
 
 
 class ShardRequest(BaseModel):
@@ -86,9 +81,7 @@ def create_access_token(client_id: str):
         "exp": int(time.time()) + 3600
     }
 
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-    return token
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -98,28 +91,8 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         return payload
-
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-
-# ==========================
-# SIGNED SHARD TOKEN
-# ==========================
-
-def generate_upload_token(file_id, shard_id, node_id, expiry):
-
-    payload = f"{file_id}:{shard_id}:{node_id}:{expiry}"
-
-    signature = hmac.new(
-        UPLOAD_SECRET.encode(),
-        payload.encode(),
-        hashlib.sha256
-    ).digest()
-
-    token = base64.urlsafe_b64encode(signature).decode()
-
-    return token
 
 
 # ==========================
@@ -130,18 +103,14 @@ async def recovery_worker():
 
     while True:
 
-        print("Running background recovery check...")
-
         current_time = time.time()
 
         nodes = list(nodes_collection.find())
 
         for node in nodes:
-
             last_seen = node.get("last_seen")
 
             if last_seen and current_time - last_seen > 30:
-
                 nodes_collection.update_one(
                     {"node_id": node["node_id"]},
                     {"$set": {"status": "OFFLINE"}}
@@ -152,11 +121,8 @@ async def recovery_worker():
 
         for shard in shards:
 
-            if "primary_node" not in shard or "replica_node" not in shard:
-                continue
-
-            primary_node = shard["primary_node"]
-            replica_node = shard["replica_node"]
+            primary_node = shard.get("primary_node")
+            replica_node = shard.get("replica_node")
 
             primary_status = nodes_collection.find_one({"node_id": primary_node})
 
@@ -170,7 +136,6 @@ async def recovery_worker():
                 ]
 
                 if candidates:
-
                     new_replica = random.choice(candidates)
 
                     shards_collection.update_one(
@@ -204,13 +169,8 @@ def home():
 
 @app.post("/auth/login")
 def login():
-
     token = create_access_token("trusted_client")
-
-    return {
-        "access_token": token,
-        "token_type": "bearer"
-    }
+    return {"access_token": token, "token_type": "bearer"}
 
 
 # ==========================
@@ -239,7 +199,7 @@ def join_cluster(request: JoinClusterRequest):
     })
 
     if not code_entry:
-        return {"error": "Invalid or used join code"}
+        raise HTTPException(status_code=400, detail="Invalid or used join code")
 
     node_id = str(uuid.uuid4())
 
@@ -256,7 +216,14 @@ def join_cluster(request: JoinClusterRequest):
         {"$set": {"used": True}}
     )
 
-    return {"message": "Node joined cluster", "node_id": node_id}
+    # ✅ NODE TOKEN ADDED
+    node_token = generate_node_token(node_id)
+
+    return {
+        "message": "Node joined cluster",
+        "node_id": node_id,
+        "node_token": node_token
+    }
 
 
 @app.post("/heartbeat")
@@ -279,17 +246,15 @@ def init_upload(request: UploadRequest, user=Depends(verify_token)):
 
     file_id = str(uuid.uuid4())
 
-    upload_data = {
+    uploads_collection.insert_one({
         "file_id": file_id,
         "external_file_id": request.external_file_id,
         "theatre_id": request.theatre_id,
         "total_shards": request.total_shards,
         "status": "UPLOADING"
-    }
+    })
 
-    uploads_collection.insert_one(upload_data)
-
-    return {"message": "Upload session created", "file_id": file_id}
+    return {"file_id": file_id}
 
 
 @app.post("/upload-key")
@@ -297,9 +262,12 @@ def upload_key(request: UploadKeyRequest):
 
     key_id = str(uuid.uuid4())
 
+    # ✅ ENCRYPT KEY (FIXED)
+    encrypted = encrypt_key(request.encryption_key)
+
     keys_collection.insert_one({
         "key_id": key_id,
-        "encrypted_key": request.encryption_key
+        "encrypted_key": encrypted
     })
 
     uploads_collection.update_one(
@@ -307,7 +275,7 @@ def upload_key(request: UploadKeyRequest):
         {"$set": {"key_id": key_id}}
     )
 
-    return {"message": "Key stored", "key_id": key_id}
+    return {"key_id": key_id}
 
 
 @app.post("/upload-manifest")
@@ -318,10 +286,10 @@ def upload_manifest(manifest: UploadManifestRequest, user=Depends(verify_token))
     )
 
     if not upload:
-        return {"error": "File not found"}
+        raise HTTPException(status_code=404, detail="File not found")
 
     if upload["total_shards"] != manifest.total_shards:
-        return {"error": "Shard count mismatch"}
+        raise HTTPException(status_code=400, detail="Shard count mismatch")
 
     uploads_collection.update_one(
         {"external_file_id": manifest.file_id},
@@ -331,7 +299,7 @@ def upload_manifest(manifest: UploadManifestRequest, user=Depends(verify_token))
         }}
     )
 
-    return {"message": "Manifest validated", "file_id": manifest.file_id}
+    return {"message": "Manifest validated"}
 
 
 @app.post("/complete-upload")
@@ -342,11 +310,11 @@ def complete_upload(request: CompleteUploadRequest, user=Depends(verify_token)):
         {"$set": {"status": "ACTIVE"}}
     )
 
-    return {"message": "Upload completed", "file_id": request.file_id}
+    return {"message": "Upload completed"}
 
 
 # ==========================
-# SHARD ALLOCATION
+# SHARD ALLOCATION (FIXED TOKEN)
 # ==========================
 
 @app.post("/request-shard-upload")
@@ -355,15 +323,7 @@ def request_shard_upload(shard: ShardRequest, user=Depends(verify_token)):
     nodes = list(nodes_collection.find({"status": "ACTIVE"}))
 
     if len(nodes) < 2:
-        return {"error": "At least two nodes required"}
-
-    existing = shards_collection.find_one({
-        "file_id": shard.file_id,
-        "shard_id": shard.shard_id
-    })
-
-    if existing:
-        return {"error": "Shard already allocated"}
+        raise HTTPException(status_code=400, detail="Need at least 2 nodes")
 
     primary = random.choice(nodes)
 
@@ -371,23 +331,19 @@ def request_shard_upload(shard: ShardRequest, user=Depends(verify_token)):
         n for n in nodes if n["node_id"] != primary["node_id"]
     ])
 
-    expiry = int(time.time()) + 300
-
+    # ✅ NEW SECURE TOKEN
     primary_token = generate_upload_token(
         shard.file_id,
         shard.shard_id,
-        primary["node_id"],
-        expiry
+        primary["node_id"]
     )
 
     replica_token = generate_upload_token(
         shard.file_id,
         shard.shard_id,
-        replica["node_id"],
-        expiry
+        replica["node_id"]
     )
 
-    # SAVE SHARD METADATA
     shards_collection.insert_one({
         "file_id": shard.file_id,
         "shard_id": shard.shard_id,
@@ -395,12 +351,9 @@ def request_shard_upload(shard: ShardRequest, user=Depends(verify_token)):
         "replica_node": replica["node_id"]
     })
 
-    primary_url = f"http://{primary['ip_address']}:9000/upload?token={primary_token}"
-    replica_url = f"http://{replica['ip_address']}:9000/upload?token={replica_token}"
-
     return {
-        "primary_upload_url": primary_url,
-        "replica_upload_url": replica_url,
+        "primary_upload_url": f"http://{primary['ip_address']}:9000/upload?token={primary_token}",
+        "replica_upload_url": f"http://{replica['ip_address']}:9000/upload?token={replica_token}",
         "expires_in": 300
     }
 
