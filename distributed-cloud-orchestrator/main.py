@@ -1,4 +1,5 @@
 import logging
+import json
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -267,8 +268,21 @@ def upload_manifest(manifest: UploadManifestRequest, user=Depends(verify_token))
             "status": "MANIFEST_RECEIVED"
         }}
     )
-    logger.info(f"Manifest validated for file: {manifest.file_id}")
-    return {"message": "Manifest validated"}
+
+    manifest_data = {
+        "file_id": manifest.file_id,
+        "total_shards": manifest.total_shards,
+        "hash_algorithm": manifest.hash_algorithm,
+        "shards": manifest.shards,
+        "generated_at": time.time()
+    }
+
+    manifest_path = f"manifests/{manifest.file_id}.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest_data, f, indent=2)
+
+    logger.info(f"Manifest validated and saved: {manifest_path}")
+    return {"message": "Manifest validated", "manifest_path": manifest_path}
 
 
 @app.post("/complete-upload")
