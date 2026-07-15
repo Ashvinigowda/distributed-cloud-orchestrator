@@ -47,6 +47,15 @@ class UploadRequest(BaseModel):
     playback_start: float
     playback_end: float
 
+class UploadMetadataRequest(BaseModel):
+    file_id: str
+    title: str
+    duration: int
+    resolution: str
+    codec: str
+    frame_rate: float
+    theatre_id: str
+
 class ShardRequest(BaseModel):
     file_id: str
     shard_id: str
@@ -72,6 +81,12 @@ class CompleteUploadRequest(BaseModel):
 class UploadKeyRequest(BaseModel):
     file_id: str
     encryption_key: str
+
+class ShardConfirmRequest(BaseModel):
+    file_id: str
+    shard_id: str
+    node_id: str
+    sha256: str
 
 
 # ==========================
@@ -234,6 +249,30 @@ def init_upload(request: UploadRequest, user=Depends(verify_token)):
     return {"file_id": file_id}
 
 
+@app.post("/upload-metadata")
+def upload_metadata(request: UploadMetadataRequest, user=Depends(verify_token)):
+    upload = uploads_collection.find_one({"file_id": request.file_id})
+
+    if not upload:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    uploads_collection.update_one(
+        {"file_id": request.file_id},
+        {"$set": {
+            "title": request.title,
+            "duration": request.duration,
+            "resolution": request.resolution,
+            "codec": request.codec,
+            "frame_rate": request.frame_rate,
+            "theatre_id": request.theatre_id,
+            "status": "METADATA_RECEIVED"
+        }}
+    )
+
+    logger.info(f"Metadata uploaded for file: {request.file_id}")
+    return {"message": "Metadata stored", "file_id": request.file_id}
+
+
 @app.post("/upload-key")
 def upload_key(request: UploadKeyRequest):
     key_id = str(uuid.uuid4())
@@ -336,7 +375,8 @@ def request_shard_upload(shard: ShardRequest, user=Depends(verify_token)):
         "file_id": shard.file_id,
         "shard_id": shard.shard_id,
         "primary_node": primary["node_id"],
-        "replica_node": replica["node_id"]
+        "replica_node": replica["node_id"],
+        "status": "PENDING"
     })
 
     logger.info(f"Shard {shard.shard_id} allocated — primary: {primary['node_id']}, replica: {replica['node_id']}")
@@ -346,6 +386,33 @@ def request_shard_upload(shard: ShardRequest, user=Depends(verify_token)):
         "replica_upload_url": f"http://{replica['ip_address']}:9000/upload?token={replica_token}",
         "expires_in": 300
     }
+
+
+# ==========================
+# SHARD UPLOAD CONFIRMATION
+# ==========================
+
+@app.post("/confirm-shard")
+def confirm_shard(request: ShardConfirmRequest):
+    shard = shards_collection.find_one({
+        "file_id": request.file_id,
+        "shard_id": request.shard_id
+    })
+
+    if not shard:
+        raise HTTPException(status_code=404, detail="Shard not found")
+
+    shards_collection.update_one(
+        {"file_id": request.file_id, "shard_id": request.shard_id},
+        {"$set": {
+            "status": "UPLOADED",
+            "sha256": request.sha256,
+            "uploaded_node": request.node_id
+        }}
+    )
+
+    logger.info(f"Shard confirmed: {request.shard_id} on node {request.node_id}")
+    return {"message": "Shard confirmed"}
 
 
 # ==========================

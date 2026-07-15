@@ -10,6 +10,12 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from security.token import verify_upload_token
+from node_service.encryption import (
+    chaotic_preprocess,
+    generate_shard_key,
+    encrypt_shard,
+    generate_decoy_shard
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -18,7 +24,8 @@ app = FastAPI()
 
 NODE_ID = os.getenv("NODE_ID", "node-001")
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://127.0.0.1:8000")
-SHARD_STORAGE_PATH = "shards"
+MASTER_KEY = os.getenv("MASTER_KEY", "default_master_key")
+SHARD_STORAGE_PATH = "node_service/shards"
 
 os.makedirs(SHARD_STORAGE_PATH, exist_ok=True)
 
@@ -97,16 +104,49 @@ async def upload_shard(token: str, file: UploadFile = File(...)):
 
     shard_data = await file.read()
 
-    computed_hash = hashlib.sha256(shard_data).hexdigest()
+    # Step 1 — Chaotic preprocessing
+    preprocessed = chaotic_preprocess(shard_data)
+    logger.info(f"Chaotic preprocessing done for shard: {payload['shard_id']}")
 
+    # Step 2 — Generate per-shard key
+    shard_key = generate_shard_key(MASTER_KEY, payload["shard_id"], payload["file_id"])
+
+    # Step 3 — AES-256-GCM encryption
+    nonce, encrypted = encrypt_shard(preprocessed, shard_key)
+    logger.info(f"Shard encrypted: {payload['shard_id']}")
+
+    # Step 4 — Compute hash of encrypted data
+    computed_hash = hashlib.sha256(encrypted).hexdigest()
+
+    # Step 5 — Store nonce + encrypted shard together
     shard_path = f"{SHARD_STORAGE_PATH}/{payload['shard_id']}.bin"
     with open(shard_path, "wb") as f:
-        f.write(shard_data)
+        f.write(nonce + encrypted)
 
-    logger.info(f"Shard stored: {payload['shard_id']} | SHA256: {computed_hash}")
+    # Step 6 — Generate and store a decoy shard
+    decoy_path = f"{SHARD_STORAGE_PATH}/decoy_{payload['shard_id']}.bin"
+    with open(decoy_path, "wb") as f:
+        f.write(generate_decoy_shard(len(shard_data)))
+    logger.info(f"Decoy shard created for: {payload['shard_id']}")
+
+    # Step 7 — Notify orchestrator
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{ORCHESTRATOR_URL}/confirm-shard",
+                json={
+                    "file_id": payload["file_id"],
+                    "shard_id": payload["shard_id"],
+                    "node_id": NODE_ID,
+                    "sha256": computed_hash
+                }
+            )
+            logger.info(f"Shard confirmed with orchestrator: {payload['shard_id']}")
+    except Exception as e:
+        logger.warning(f"Could not confirm shard with orchestrator: {e}")
 
     return {
-        "message": "Shard uploaded successfully",
+        "message": "Shard uploaded, encrypted and stored",
         "shard_id": payload["shard_id"],
         "sha256": computed_hash
     }
@@ -120,7 +160,6 @@ async def upload_shard(token: str, file: UploadFile = File(...)):
 def replicate_shard(request: ReplicateRequest):
 
     shard_data = bytes.fromhex(request.shard_data)
-
     computed_hash = hashlib.sha256(shard_data).hexdigest()
 
     shard_path = f"{SHARD_STORAGE_PATH}/{request.shard_id}.bin"
