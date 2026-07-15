@@ -1,4 +1,5 @@
 import logging
+import uuid
 import hashlib
 import os
 import httpx
@@ -172,4 +173,76 @@ def replicate_shard(request: ReplicateRequest):
         "message": "Shard replicated successfully",
         "shard_id": request.shard_id,
         "sha256": computed_hash
+    }
+
+# ==========================
+# SPLIT AND UPLOAD FULL FILE
+# ==========================
+
+@app.post("/split-and-upload")
+async def split_and_upload(file_id: str, num_shards: int, file: UploadFile = File(...)):
+
+    file_data = await file.read()
+    logger.info(f"Received file for splitting: {file_id} — size: {len(file_data)} bytes")
+
+    # Step 1 — Split into variable size shards
+    from node_service.encryption import create_variable_shards
+    shards = create_variable_shards(file_data, num_shards)
+    logger.info(f"Split into {len(shards)} variable-size shards")
+
+    results = []
+
+    for i, shard_data in enumerate(shards):
+        shard_id = str(uuid.uuid4())
+
+        # Step 2 — Chaotic preprocessing
+        preprocessed = chaotic_preprocess(shard_data)
+
+        # Step 3 — Generate per-shard key
+        shard_key = generate_shard_key(MASTER_KEY, shard_id, file_id)
+
+        # Step 4 — AES-256-GCM encryption
+        nonce, encrypted = encrypt_shard(preprocessed, shard_key)
+
+        # Step 5 — Compute hash
+        computed_hash = hashlib.sha256(encrypted).hexdigest()
+
+        # Step 6 — Store shard
+        shard_path = f"{SHARD_STORAGE_PATH}/{shard_id}.bin"
+        with open(shard_path, "wb") as f:
+            f.write(nonce + encrypted)
+
+        # Step 7 — Generate decoy
+        decoy_path = f"{SHARD_STORAGE_PATH}/decoy_{shard_id}.bin"
+        with open(decoy_path, "wb") as f:
+            f.write(generate_decoy_shard(len(shard_data)))
+
+        # Step 8 — Notify orchestrator
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{ORCHESTRATOR_URL}/confirm-shard",
+                    json={
+                        "file_id": file_id,
+                        "shard_id": shard_id,
+                        "node_id": NODE_ID,
+                        "sha256": computed_hash
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"Could not confirm shard {shard_id}: {e}")
+
+        results.append({
+            "shard_id": shard_id,
+            "size": len(shard_data),
+            "sha256": computed_hash
+        })
+
+        logger.info(f"Shard {i+1}/{len(shards)} processed: {shard_id}")
+
+    return {
+        "message": "File split and uploaded successfully",
+        "file_id": file_id,
+        "total_shards": len(results),
+        "shards": results
     }
